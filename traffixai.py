@@ -299,14 +299,20 @@ class TrackedObject:
 
 
 class ObjectTracker:
-    """Main tracker class handling centroid matching and track lifecycle."""
+    """
+    Main tracker class handling centroid matching and track lifecycle.
+    
+    Note: Entry/exit counting currently tracks lane transitions rather than
+    actual entry/exit from the monitored area. For true entry/exit counting,
+    entry/exit zones would need to be defined.
+    """
     
     def __init__(self):
         self.tracks: List[TrackedObject] = []
         self.frame_num = 0
         self.total_tracked = 0
         
-        # Entry/exit counting per lane
+        # Entry/exit counting per lane (tracks lane transitions)
         self.lane_entries: Dict[Lane, int] = {lane: 0 for lane in Lane}
         self.lane_exits: Dict[Lane, int] = {lane: 0 for lane in Lane}
     
@@ -350,7 +356,7 @@ class ObjectTracker:
                 matched_tracks.add(i)
                 matched_detections.add(best_match)
                 
-                # Check for lane change (entry/exit)
+                # Track lane transitions (not true entry/exit from monitored area)
                 old_lane = track.lane_history[-2] if len(track.lane_history) >= 2 else None
                 new_lane = track.current_lane
                 if old_lane and old_lane != new_lane and \
@@ -370,7 +376,7 @@ class ObjectTracker:
                 self.tracks.append(new_track)
                 self.total_tracked += 1
                 
-                # Count as entry if in a specific lane
+                # Count initial lane appearance (may include re-detections)
                 if lanes[j] != Lane.UNKNOWN:
                     self.lane_entries[lanes[j]] += 1
         
@@ -382,7 +388,7 @@ class ObjectTracker:
         tracks_to_remove = []
         for track in self.tracks:
             if track.should_remove():
-                # Count as exit from last known lane
+                # Count as lane exit when track is lost (may include temporary losses)
                 if track.current_lane != Lane.UNKNOWN:
                     self.lane_exits[track.current_lane] += 1
                 tracks_to_remove.append(track)
