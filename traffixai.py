@@ -104,9 +104,9 @@ class Colors:
 # Lane color mapping
 LANE_COLORS:  Dict[Lane, Tuple[int, int, int]] = {
     Lane.NORTH: Colors.NORTH,
-    Lane. SOUTH: Colors.SOUTH,
+    Lane.SOUTH: Colors.SOUTH,
     Lane.EAST: Colors.EAST,
-    Lane. WEST: Colors.WEST,
+    Lane.WEST: Colors.WEST,
     Lane.JUNCTION: Colors.JUNCTION,
     Lane.UNKNOWN:  Colors.GRAY,
 }
@@ -499,8 +499,8 @@ class LaneDetector:
             Lane.NORTH: None,
             Lane.SOUTH:  None,
             Lane.EAST: None,
-            Lane. WEST: None,
-            Lane. JUNCTION: None,
+            Lane.WEST: None,
+            Lane.JUNCTION: None,
         }
         self.lane_points: Dict[Lane, List[List[int]]] = {
             Lane.NORTH: [],
@@ -547,21 +547,21 @@ class LaneDetector:
         Priority: Junction > Specific Lanes > Unknown
         """
         if not self._initialized:
-            return Lane. UNKNOWN
+            return Lane.UNKNOWN
         
         # Check bounds
         if self.frame_shape:
             h, w = self. frame_shape
             if not (0 <= cx < w and 0 <= cy < h):
-                return Lane. UNKNOWN
+                return Lane.UNKNOWN
         
         # Check junction first (highest priority for roundabout center)
         if self.lane_masks[Lane.JUNCTION] is not None:
-            if self.lane_masks[Lane. JUNCTION][cy, cx] > 0:
-                return Lane. JUNCTION
+            if self.lane_masks[Lane.JUNCTION][cy, cx] > 0:
+                return Lane.JUNCTION
         
         # Check each lane
-        for lane in [Lane.NORTH, Lane. SOUTH, Lane.EAST, Lane.WEST]:
+        for lane in [Lane.NORTH, Lane.SOUTH, Lane.EAST, Lane.WEST]:
             if self.lane_masks[lane] is not None:
                 if self. lane_masks[lane][cy, cx] > 0:
                     return lane
@@ -585,7 +585,7 @@ class LaneDetector:
         
         for lane, mask in self.lane_masks.items():
             if mask is not None:
-                color = LANE_COLORS. get(lane, COLORS. GRAY)
+                color = LANE_COLORS.get(lane, COLORS.GRAY)
                 colored = np.zeros_like(frame)
                 colored[: ] = color
                 lane_overlay = cv2.bitwise_and(colored, colored, mask=mask)
@@ -818,7 +818,7 @@ class ROISetup:
             display = frame.copy()
             self._draw_prototype_overlay(display, prototype_points, dim=True)
             self._draw_header(display, "STEP 2:  Trace ROAD boundary")
-            self._draw_polygon_preview(display, self.road_points, COLORS. ROAD_OVERLAY, COLORS.ROAD_OVERLAY)
+            self._draw_polygon_preview(display, self.road_points, COLORS.ROAD_OVERLAY, COLORS.ROAD_OVERLAY)
             self._draw_point_count(display, len(self.road_points), "Road points")
             self._draw_controls(display, "Left: Add | Right: Undo | [R] Reset | [C] Complete | [Q] Cancel")
             
@@ -916,7 +916,7 @@ class ROISetup:
             for prev_lane, points in self.lane_points.items():
                 if points and len(points) >= CONFIG.MIN_POLYGON_POINTS and prev_lane != lane:
                     pts = np.array(points, dtype=np.int32)
-                    prev_color = LANE_COLORS.get(prev_lane, COLORS. GRAY)
+                    prev_color = LANE_COLORS.get(prev_lane, COLORS.GRAY)
                     overlay = display.copy()
                     cv2.fillPoly(overlay, [pts], prev_color)
                     cv2.addWeighted(overlay, 0.3, display, 0.7, 0, display)
@@ -966,7 +966,7 @@ class ROISetup:
         
         # Preview lines to mouse
         if num_points >= 1:
-            cv2.line(frame, tuple(points[-1]), self.mouse_pos, COLORS. PREVIEW, 1, cv2.LINE_AA)
+            cv2.line(frame, tuple(points[-1]), self.mouse_pos, COLORS.PREVIEW, 1, cv2.LINE_AA)
             if num_points >= 2:
                 cv2.line(frame, self.mouse_pos, tuple(points[0]), COLORS.PREVIEW, 1, cv2.LINE_AA)
         
@@ -989,17 +989,17 @@ class ROISetup:
     def _draw_point_count(self, frame: np.ndarray, count: int, label: str) -> None:
         """Draw point count info."""
         cv2.putText(frame, f"{label}: {count} (min {CONFIG.MIN_POLYGON_POINTS})",
-                   (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, COLORS. WHITE, 2)
+                   (20, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, COLORS.WHITE, 2)
         
         if count >= CONFIG.MIN_POLYGON_POINTS:
             cv2.putText(frame, "Press [C] to complete or keep adding",
-                       (20, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLORS. POINT, 2)
+                       (20, 115), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLORS.POINT, 2)
     
     @staticmethod
     def _draw_header(frame: np.ndarray, text: str) -> None:
         """Draw header."""
         cv2.rectangle(frame, (0, 0), (frame.shape[1], 55), COLORS.BLACK, -1)
-        cv2.putText(frame, text, (20, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.8, COLORS. CORNER, 2)
+        cv2.putText(frame, text, (20, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.8, COLORS.CORNER, 2)
     
     @staticmethod
     def _draw_controls(frame: np.ndarray, text: str) -> None:
@@ -1082,7 +1082,7 @@ def create_visualization(frame: np.ndarray, prototype_points: np.ndarray,
     
     # Draw prototype boundary
     if prototype_points is not None and len(prototype_points) >= CONFIG.MIN_POLYGON_POINTS:
-        cv2.polylines(display, [prototype_points], True, COLORS. ROI_BORDER, 2)
+        cv2.polylines(display, [prototype_points], True, COLORS.ROI_BORDER, 2)
     
     return display
 
@@ -1196,7 +1196,7 @@ def draw_detection(frame: np.ndarray, box, class_id: int, confidence: float,
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLORS.WHITE, 1)
     
     # Draw small lane indicator badge at bottom-right of box
-    if show_lane and lane != Lane. UNKNOWN:
+    if show_lane and lane != Lane.UNKNOWN:
         badge_text = lane.value[0]  # First letter (N, S, E, W, J)
         badge_size = 24
         badge_x = x2 - badge_size - 2
@@ -1286,12 +1286,12 @@ def draw_stats(frame: np.ndarray, fps: float, car_count: int, ambulance_count: i
     # Lane counts with colored indicators
     if show_lanes and any(v > 0 for k, v in lane_counts.items() if k != Lane.UNKNOWN):
         y += 30
-        cv2.putText(frame, "Vehicles per Lane:", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLORS. CORNER, 1)
+        cv2.putText(frame, "Vehicles per Lane:", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLORS.CORNER, 1)
         
-        for lane in [Lane.NORTH, Lane.SOUTH, Lane. EAST, Lane.WEST, Lane.JUNCTION]:
+        for lane in [Lane.NORTH, Lane.SOUTH, Lane.EAST, Lane.WEST, Lane.JUNCTION]:
             count = lane_counts.get(lane, 0)
             y += 22
-            lane_color = LANE_COLORS.get(lane, COLORS. GRAY)
+            lane_color = LANE_COLORS.get(lane, COLORS.GRAY)
             
             # Draw colored square indicator
             cv2.rectangle(frame, (20, y - 12), (32, y), lane_color, -1)
