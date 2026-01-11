@@ -1117,7 +1117,14 @@ def draw_detection(frame: np.ndarray, box, class_id: int, confidence: float,
     - Lane-colored indicator stripe
     - Confirmation status (border color)
     """
-    xyxy = box if isinstance(box, np.ndarray) else box.xyxy[0].cpu().numpy().astype(np.int32)
+    # Extract bounding box coordinates (handle both numpy array and YOLO result)
+    if isinstance(box, np.ndarray):
+        # Already in xyxy format (from tracked object)
+        xyxy = box
+    else:
+        # YOLO result object - extract and convert
+        xyxy = box.xyxy[0].cpu().numpy().astype(np.int32)
+    
     x1, y1, x2, y2 = xyxy
     box_width = x2 - x1
     box_height = y2 - y1
