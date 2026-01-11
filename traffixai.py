@@ -55,6 +55,7 @@ class TrackingConfig:
     SIZE_SMOOTHING_ALPHA: float = 0.8  # Exponential smoothing for size
     LANE_STABILITY_FRAMES: int = 3  # Consecutive frames in lane before changing
     CONFIDENCE_HISTORY_SIZE: int = 5  # Number of frames for confidence averaging
+    MAX_TRAIL_HISTORY: int = 30  # Maximum trail history points to keep
 
 
 @dataclass(frozen=True)
@@ -94,6 +95,10 @@ class Colors:
     EAST:  Tuple[int, int, int] = (100, 255, 100)     # Green-ish
     WEST: Tuple[int, int, int] = (255, 255, 100)     # Cyan-ish
     JUNCTION: Tuple[int, int, int] = (255, 100, 255) # Magenta
+    
+    # Trail visualization constants
+    TRAIL_CENTER_RADIUS: int = 4  # Radius of center point circle
+    TRAIL_OUTLINE_RADIUS: int = 6  # Radius of outline circle
 
 
 # Lane color mapping
@@ -116,7 +121,7 @@ KERNEL_5x5 = np.ones((5, 5), dtype=np.uint8)
 
 # Yellow color range for road detection (HSV)
 YELLOW_LOWER = np.array([15, 50, 50], dtype=np.uint8)
-YELLOW_UPPER = np. array([40, 255, 255], dtype=np.uint8)
+YELLOW_UPPER = np.array([40, 255, 255], dtype=np.uint8)
 
 
 # ============================================================
@@ -266,7 +271,7 @@ class TrackedObject:
         
         # Update history
         self.position_history.append(self.smoothed_center)
-        if len(self.position_history) > 30:  # Keep last 30 positions
+        if len(self.position_history) > TRACKING_CONFIG.MAX_TRAIL_HISTORY:
             self.position_history.pop(0)
         
         self.confidence_history.append(detection.confidence)
@@ -316,11 +321,9 @@ class ObjectTracker:
             self._cleanup_tracks()
             return
         
-        # Match detections to existing tracks
+        # Match detections to existing tracks using greedy matching
         matched_tracks = set()
         matched_detections = set()
-        
-        # Build cost matrix for Hungarian algorithm (simple greedy matching)
         for i, track in enumerate(self.tracks):
             best_match = None
             best_distance = float('inf')
@@ -1223,8 +1226,8 @@ def draw_track_trail(frame: np.ndarray, track: TrackedObject, lane_color: Tuple[
     
     # Draw center point
     cx, cy = int(track.smoothed_center[0]), int(track.smoothed_center[1])
-    cv2.circle(frame, (cx, cy), 4, lane_color, -1)
-    cv2.circle(frame, (cx, cy), 6, COLORS.WHITE, 2)
+    cv2.circle(frame, (cx, cy), COLORS.TRAIL_CENTER_RADIUS, lane_color, -1)
+    cv2.circle(frame, (cx, cy), COLORS.TRAIL_OUTLINE_RADIUS, COLORS.WHITE, 2)
 
 
 def draw_stats(frame: np.ndarray, fps: float, car_count: int, ambulance_count: int,
@@ -1244,7 +1247,7 @@ def draw_stats(frame: np.ndarray, fps: float, car_count: int, ambulance_count: i
     cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
     
     y = 40
-    cv2.putText(frame, "TRAFFIX-AI + Tracking", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.9, COLORS. CORNER, 2)
+    cv2.putText(frame, "TRAFFIX-AI + Tracking", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.9, COLORS.CORNER, 2)
     
     y += 30
     roi_color = COLORS.POINT if roi_active else (0, 0, 255)
@@ -1297,8 +1300,11 @@ def draw_controls(frame: np.ndarray) -> None:
     """Draw control bar."""
     h, w = frame.shape[:2]
     cv2.rectangle(frame, (0, h - 35), (w, h), COLORS.BLACK, -1)
-    cv2.putText(frame, "[Q] Quit | [R] ROI | [L] Lanes | [S] Setup | [D] Delete | [C] Clear Tracks | [T] Trails | [+/-] Sens",
-               (20, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLORS.LIGHT_GRAY, 1)
+    # Split controls into two lines for better readability
+    cv2.putText(frame, "[Q] Quit | [R] ROI | [L] Lanes | [S] Setup | [D] Delete",
+               (20, h - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLORS.LIGHT_GRAY, 1)
+    cv2.putText(frame, "[C] Clear Tracks | [T] Trails | [+/-] Sensitivity",
+               (20, h - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLORS.LIGHT_GRAY, 1)
 
 
 # ============================================================
