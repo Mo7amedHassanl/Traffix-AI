@@ -34,6 +34,30 @@ class Lane(Enum):
 
 
 @dataclass(frozen=True)
+class FilteringConfig:
+    """Detection filtering configuration."""
+    MIN_AREA: float = 400.0  # Minimum detection area in pixels²
+    MAX_AREA: float = 150000.0  # Maximum detection area in pixels²
+    MIN_ASPECT_RATIO: float = 0.3  # Minimum width/height ratio
+    MAX_ASPECT_RATIO: float = 3.5  # Maximum width/height ratio
+    MIN_CONFIDENCE: float = 0.35  # Minimum confidence after initial detection
+
+
+@dataclass(frozen=True)
+class TrackingConfig:
+    """Object tracking configuration."""
+    MAX_CENTROID_DISTANCE: float = 100.0  # Max distance for centroid matching
+    MIN_CONSECUTIVE_DETECTIONS: int = 3  # Detections required before confirming track
+    MAX_FRAMES_WITHOUT_DETECTION: int = 15  # Frames before removing track
+    DUPLICATE_IOU_THRESHOLD: float = 0.5  # IoU threshold for duplicate removal
+    DUPLICATE_CENTER_DISTANCE: float = 50.0  # Center distance for duplicate removal
+    POSITION_SMOOTHING_ALPHA: float = 0.7  # Exponential smoothing for position
+    SIZE_SMOOTHING_ALPHA: float = 0.8  # Exponential smoothing for size
+    LANE_STABILITY_FRAMES: int = 3  # Consecutive frames in lane before changing
+    CONFIDENCE_HISTORY_SIZE: int = 5  # Number of frames for confidence averaging
+
+
+@dataclass(frozen=True)
 class Config:
     """Application configuration constants."""
     MODEL_PATH: str = "best.pt"
@@ -84,6 +108,8 @@ LANE_COLORS:  Dict[Lane, Tuple[int, int, int]] = {
 
 CONFIG = Config()
 COLORS = Colors()
+FILTERING_CONFIG = FilteringConfig()
+TRACKING_CONFIG = TrackingConfig()
 
 # Pre-computed kernels
 KERNEL_5x5 = np.ones((5, 5), dtype=np.uint8)
@@ -91,6 +117,318 @@ KERNEL_5x5 = np.ones((5, 5), dtype=np.uint8)
 # Yellow color range for road detection (HSV)
 YELLOW_LOWER = np.array([15, 50, 50], dtype=np.uint8)
 YELLOW_UPPER = np. array([40, 255, 255], dtype=np.uint8)
+
+
+# ============================================================
+# DETECTION AND TRACKING CLASSES
+# ============================================================
+@dataclass
+class Detection:
+    """Single YOLO detection with computed properties."""
+    box: np.ndarray  # xyxy format
+    class_id: int
+    confidence: float
+    
+    @property
+    def center(self) -> Tuple[int, int]:
+        """Get center point."""
+        cx = int((self.box[0] + self.box[2]) * 0.5)
+        cy = int((self.box[1] + self.box[3]) * 0.5)
+        return (cx, cy)
+    
+    @property
+    def area(self) -> float:
+        """Get bounding box area."""
+        width = self.box[2] - self.box[0]
+        height = self.box[3] - self.box[1]
+        return float(width * height)
+    
+    @property
+    def aspect_ratio(self) -> float:
+        """Get width/height ratio."""
+        width = self.box[2] - self.box[0]
+        height = self.box[3] - self.box[1]
+        return float(width / height) if height > 0 else 0.0
+    
+    def is_valid(self) -> bool:
+        """Check if detection passes filtering criteria."""
+        # Size filtering
+        if self.area < FILTERING_CONFIG.MIN_AREA or self.area > FILTERING_CONFIG.MAX_AREA:
+            return False
+        
+        # Aspect ratio check
+        if self.aspect_ratio < FILTERING_CONFIG.MIN_ASPECT_RATIO or \
+           self.aspect_ratio > FILTERING_CONFIG.MAX_ASPECT_RATIO:
+            return False
+        
+        # Confidence threshold
+        if self.confidence < FILTERING_CONFIG.MIN_CONFIDENCE:
+            return False
+        
+        return True
+    
+    def iou(self, other: 'Detection') -> float:
+        """Calculate IoU with another detection."""
+        x1 = max(self.box[0], other.box[0])
+        y1 = max(self.box[1], other.box[1])
+        x2 = min(self.box[2], other.box[2])
+        y2 = min(self.box[3], other.box[3])
+        
+        if x2 < x1 or y2 < y1:
+            return 0.0
+        
+        intersection = (x2 - x1) * (y2 - y1)
+        union = self.area + other.area - intersection
+        
+        return float(intersection / union) if union > 0 else 0.0
+    
+    def center_distance(self, other: 'Detection') -> float:
+        """Calculate center distance to another detection."""
+        cx1, cy1 = self.center
+        cx2, cy2 = other.center
+        return float(np.sqrt((cx1 - cx2)**2 + (cy1 - cy2)**2))
+
+
+class TrackedObject:
+    """Tracked vehicle with history and smoothing."""
+    
+    _next_id = 1
+    
+    def __init__(self, detection: Detection, lane: Lane, frame_num: int):
+        self.track_id = TrackedObject._next_id
+        TrackedObject._next_id += 1
+        
+        self.class_id = detection.class_id
+        self.confirmed = False
+        self.consecutive_detections = 1
+        self.frames_without_detection = 0
+        self.last_seen_frame = frame_num
+        
+        # Position and size (smoothed)
+        cx, cy = detection.center
+        self.smoothed_center = (float(cx), float(cy))
+        self.smoothed_box = detection.box.copy().astype(float)
+        
+        # History
+        self.position_history: List[Tuple[float, float]] = [self.smoothed_center]
+        self.confidence_history: List[float] = [detection.confidence]
+        
+        # Lane tracking
+        self.current_lane = lane
+        self.lane_history: List[Lane] = [lane]
+        self.entry_lane = lane
+        
+    @property
+    def vehicle_type(self) -> str:
+        """Get vehicle type string."""
+        return "Ambulance" if self.class_id == 0 else "Car"
+    
+    @property
+    def avg_confidence(self) -> float:
+        """Get average confidence over recent frames."""
+        history = self.confidence_history[-TRACKING_CONFIG.CONFIDENCE_HISTORY_SIZE:]
+        return sum(history) / len(history) if history else 0.0
+    
+    @property
+    def stable_lane(self) -> Lane:
+        """Get stable lane (requires consistency across frames)."""
+        recent_lanes = self.lane_history[-TRACKING_CONFIG.LANE_STABILITY_FRAMES:]
+        if len(recent_lanes) >= TRACKING_CONFIG.LANE_STABILITY_FRAMES:
+            # Check if all recent lanes are the same
+            if all(l == recent_lanes[0] for l in recent_lanes):
+                return recent_lanes[0]
+        return self.current_lane
+    
+    def update(self, detection: Detection, lane: Lane, frame_num: int) -> None:
+        """Update tracked object with new detection."""
+        self.consecutive_detections += 1
+        self.frames_without_detection = 0
+        self.last_seen_frame = frame_num
+        
+        # Confirm track if enough consecutive detections
+        if not self.confirmed and \
+           self.consecutive_detections >= TRACKING_CONFIG.MIN_CONSECUTIVE_DETECTIONS:
+            self.confirmed = True
+        
+        # Smooth position
+        cx, cy = detection.center
+        alpha = TRACKING_CONFIG.POSITION_SMOOTHING_ALPHA
+        self.smoothed_center = (
+            alpha * cx + (1 - alpha) * self.smoothed_center[0],
+            alpha * cy + (1 - alpha) * self.smoothed_center[1]
+        )
+        
+        # Smooth bounding box size
+        alpha_size = TRACKING_CONFIG.SIZE_SMOOTHING_ALPHA
+        self.smoothed_box = (
+            alpha_size * detection.box + (1 - alpha_size) * self.smoothed_box
+        )
+        
+        # Update history
+        self.position_history.append(self.smoothed_center)
+        if len(self.position_history) > 30:  # Keep last 30 positions
+            self.position_history.pop(0)
+        
+        self.confidence_history.append(detection.confidence)
+        if len(self.confidence_history) > TRACKING_CONFIG.CONFIDENCE_HISTORY_SIZE:
+            self.confidence_history.pop(0)
+        
+        # Update lane
+        self.current_lane = lane
+        self.lane_history.append(lane)
+        if len(self.lane_history) > TRACKING_CONFIG.LANE_STABILITY_FRAMES:
+            self.lane_history.pop(0)
+    
+    def mark_missed(self) -> None:
+        """Mark that this track was not matched in current frame."""
+        self.frames_without_detection += 1
+        self.consecutive_detections = 0
+    
+    def should_remove(self) -> bool:
+        """Check if track should be removed."""
+        return self.frames_without_detection >= TRACKING_CONFIG.MAX_FRAMES_WITHOUT_DETECTION
+    
+    def get_display_box(self) -> np.ndarray:
+        """Get smoothed bounding box for display."""
+        return self.smoothed_box.astype(np.int32)
+
+
+class ObjectTracker:
+    """Main tracker class handling centroid matching and track lifecycle."""
+    
+    def __init__(self):
+        self.tracks: List[TrackedObject] = []
+        self.frame_num = 0
+        self.total_tracked = 0
+        
+        # Entry/exit counting per lane
+        self.lane_entries: Dict[Lane, int] = {lane: 0 for lane in Lane}
+        self.lane_exits: Dict[Lane, int] = {lane: 0 for lane in Lane}
+    
+    def update(self, detections: List[Detection], lanes: List[Lane]) -> None:
+        """Update tracks with new detections."""
+        self.frame_num += 1
+        
+        if not detections:
+            # No detections, mark all tracks as missed
+            for track in self.tracks:
+                track.mark_missed()
+            self._cleanup_tracks()
+            return
+        
+        # Match detections to existing tracks
+        matched_tracks = set()
+        matched_detections = set()
+        
+        # Build cost matrix for Hungarian algorithm (simple greedy matching)
+        for i, track in enumerate(self.tracks):
+            best_match = None
+            best_distance = float('inf')
+            
+            for j, detection in enumerate(detections):
+                if j in matched_detections:
+                    continue
+                
+                # Calculate distance from track to detection
+                cx, cy = detection.center
+                tx, ty = track.smoothed_center
+                distance = np.sqrt((cx - tx)**2 + (cy - ty)**2)
+                
+                # Only consider if within max distance and same class
+                if distance < TRACKING_CONFIG.MAX_CENTROID_DISTANCE and \
+                   detection.class_id == track.class_id:
+                    if distance < best_distance:
+                        best_distance = distance
+                        best_match = j
+            
+            if best_match is not None:
+                # Update track with matched detection
+                track.update(detections[best_match], lanes[best_match], self.frame_num)
+                matched_tracks.add(i)
+                matched_detections.add(best_match)
+                
+                # Check for lane change (entry/exit)
+                old_lane = track.lane_history[-2] if len(track.lane_history) >= 2 else None
+                new_lane = track.current_lane
+                if old_lane and old_lane != new_lane and \
+                   old_lane != Lane.UNKNOWN and new_lane != Lane.UNKNOWN:
+                    self.lane_exits[old_lane] += 1
+                    self.lane_entries[new_lane] += 1
+        
+        # Mark unmatched tracks as missed
+        for i, track in enumerate(self.tracks):
+            if i not in matched_tracks:
+                track.mark_missed()
+        
+        # Create new tracks for unmatched detections
+        for j, detection in enumerate(detections):
+            if j not in matched_detections:
+                new_track = TrackedObject(detection, lanes[j], self.frame_num)
+                self.tracks.append(new_track)
+                self.total_tracked += 1
+                
+                # Count as entry if in a specific lane
+                if lanes[j] != Lane.UNKNOWN:
+                    self.lane_entries[lanes[j]] += 1
+        
+        # Remove old tracks
+        self._cleanup_tracks()
+    
+    def _cleanup_tracks(self) -> None:
+        """Remove tracks that haven't been seen for too long."""
+        tracks_to_remove = []
+        for track in self.tracks:
+            if track.should_remove():
+                # Count as exit from last known lane
+                if track.current_lane != Lane.UNKNOWN:
+                    self.lane_exits[track.current_lane] += 1
+                tracks_to_remove.append(track)
+        
+        for track in tracks_to_remove:
+            self.tracks.remove(track)
+    
+    def get_confirmed_tracks(self) -> List[TrackedObject]:
+        """Get only confirmed tracks."""
+        return [t for t in self.tracks if t.confirmed]
+    
+    def get_tentative_tracks(self) -> List[TrackedObject]:
+        """Get only tentative (unconfirmed) tracks."""
+        return [t for t in self.tracks if not t.confirmed]
+    
+    def clear_all_tracks(self) -> None:
+        """Clear all tracks."""
+        self.tracks.clear()
+        self.frame_num = 0
+        # Don't reset total_tracked or entry/exit counts
+
+
+def remove_duplicate_detections(detections: List[Detection]) -> List[Detection]:
+    """Remove duplicate detections using IoU and center distance."""
+    if len(detections) <= 1:
+        return detections
+    
+    # Sort by confidence (highest first)
+    sorted_dets = sorted(detections, key=lambda d: d.confidence, reverse=True)
+    
+    keep = []
+    for det in sorted_dets:
+        is_duplicate = False
+        
+        for kept_det in keep:
+            # Check IoU overlap
+            if det.iou(kept_det) > TRACKING_CONFIG.DUPLICATE_IOU_THRESHOLD:
+                is_duplicate = True
+                break
+            
+            # Check center distance
+            if det.center_distance(kept_det) < TRACKING_CONFIG.DUPLICATE_CENTER_DISTANCE:
+                is_duplicate = True
+                break
+        
+        if not is_duplicate:
+            keep.append(det)
+    
+    return keep
 
 
 # ============================================================
@@ -757,17 +1095,20 @@ def is_detection_in_roi(box, mask:  np.ndarray) -> bool:
 
 
 def draw_detection(frame: np.ndarray, box, class_id: int, confidence: float,
-                   in_roi: bool, lane:  Lane, show_lane: bool = True) -> Tuple[str, bool]:
+                   in_roi: bool, lane:  Lane, show_lane: bool = True, 
+                   track_id: Optional[int] = None, confirmed: bool = True) -> Tuple[str, bool]:
     """
-    Draw detection bounding box with lane information prominently displayed.
+    Draw detection bounding box with lane information and tracking ID.
     
     The box shows:
+    - Track ID (if provided)
     - Vehicle type (Car/Ambulance)
     - Confidence score
     - Lane name (displayed prominently)
     - Lane-colored indicator stripe
+    - Confirmation status (border color)
     """
-    xyxy = box.xyxy[0].cpu().numpy().astype(np.int32)
+    xyxy = box if isinstance(box, np.ndarray) else box.xyxy[0].cpu().numpy().astype(np.int32)
     x1, y1, x2, y2 = xyxy
     box_width = x2 - x1
     box_height = y2 - y1
@@ -797,16 +1138,26 @@ def draw_detection(frame: np.ndarray, box, class_id: int, confidence: float,
     lane_color = LANE_COLORS.get(lane, COLORS.GRAY)
     
     # Draw main bounding box with vehicle type color
-    cv2.rectangle(frame, (x1, y1), (x2, y2), base_color, 2)
+    # Use different thickness/style for confirmed vs tentative
+    if confirmed:
+        cv2.rectangle(frame, (x1, y1), (x2, y2), base_color, 2)
+    else:
+        # Tentative track - dashed border
+        cv2.rectangle(frame, (x1, y1), (x2, y2), COLORS.GRAY, 2)
     
     # Draw lane-colored stripe on the left side of box
     stripe_width = max(4, box_width // 20)
     cv2.rectangle(frame, (x1 - stripe_width - 2, y1), (x1 - 2, y2), lane_color, -1)
     
-    # Prepare label text
+    # Prepare label text with track ID
+    if track_id is not None:
+        vehicle_label = f"#{track_id} {vehicle_type}: {confidence:.2f}"
+    else:
+        vehicle_label = f"{vehicle_type}: {confidence:.2f}"
+    
     if show_lane and lane != Lane.UNKNOWN:
         # Two-line label:  Vehicle info on top, Lane on bottom
-        line1 = f"{vehicle_type}:  {confidence:.2f}"
+        line1 = vehicle_label
         line2 = f"Lane:  {lane.value}"
         
         # Calculate text sizes
@@ -829,7 +1180,7 @@ def draw_detection(frame: np.ndarray, box, class_id: int, confidence: float,
                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, COLORS.WHITE, 2, cv2.LINE_AA)
     else:
         # Single line label (no lane info)
-        label_text = f"{vehicle_type}: {confidence:.2f}"
+        label_text = vehicle_label
         (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
         cv2.rectangle(frame, (x1, y1 - th - 10), (x1 + tw + 10, y1), base_color, -1)
         cv2.putText(frame, label_text, (x1 + 5, y1 - 5),
@@ -853,21 +1204,47 @@ def draw_detection(frame: np.ndarray, box, class_id: int, confidence: float,
     return vehicle_type, True
 
 
+def draw_track_trail(frame: np.ndarray, track: TrackedObject, lane_color: Tuple[int, int, int]) -> None:
+    """Draw position history trail for a tracked object."""
+    if len(track.position_history) < 2:
+        return
+    
+    # Draw trail with fading effect
+    num_points = len(track.position_history)
+    for i in range(1, num_points):
+        pt1 = (int(track.position_history[i-1][0]), int(track.position_history[i-1][1]))
+        pt2 = (int(track.position_history[i][0]), int(track.position_history[i][1]))
+        
+        # Fade from transparent to opaque
+        alpha = i / num_points
+        thickness = int(2 + alpha * 2)
+        
+        cv2.line(frame, pt1, pt2, lane_color, thickness, cv2.LINE_AA)
+    
+    # Draw center point
+    cx, cy = int(track.smoothed_center[0]), int(track.smoothed_center[1])
+    cv2.circle(frame, (cx, cy), 4, lane_color, -1)
+    cv2.circle(frame, (cx, cy), 6, COLORS.WHITE, 2)
+
+
 def draw_stats(frame: np.ndarray, fps: float, car_count: int, ambulance_count: int,
                filtered_count: int, roi_active: bool, roi_mode: str,
-               lane_counts: Dict[Lane, int], show_lanes: bool) -> None:
-    """Draw statistics overlay with lane counts."""
+               lane_counts: Dict[Lane, int], show_lanes: bool,
+               tracker: Optional['ObjectTracker'] = None) -> None:
+    """Draw statistics overlay with lane counts and tracking info."""
     # Calculate panel height based on content
     panel_height = 200
+    if tracker is not None:
+        panel_height = 240
     if show_lanes and any(v > 0 for k, v in lane_counts.items() if k != Lane.UNKNOWN):
-        panel_height = 290
+        panel_height += 120
     
     overlay = frame.copy()
     cv2.rectangle(overlay, (10, 10), (380, panel_height), COLORS.BLACK, -1)
     cv2.addWeighted(overlay, 0.6, frame, 0.4, 0, frame)
     
     y = 40
-    cv2.putText(frame, "TRAFFIX-AI", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.9, COLORS. CORNER, 2)
+    cv2.putText(frame, "TRAFFIX-AI + Tracking", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.9, COLORS. CORNER, 2)
     
     y += 30
     roi_color = COLORS.POINT if roi_active else (0, 0, 255)
@@ -877,13 +1254,25 @@ def draw_stats(frame: np.ndarray, fps: float, car_count: int, ambulance_count: i
     y += 30
     cv2.putText(frame, f"FPS:  {int(fps)}", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLORS.WHITE, 1)
     
+    # Tracking stats
+    if tracker is not None:
+        y += 30
+        cv2.putText(frame, "Tracking Stats:", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLORS.CORNER, 1)
+        
+        confirmed = len(tracker.get_confirmed_tracks())
+        tentative = len(tracker.get_tentative_tracks())
+        
+        y += 22
+        cv2.putText(frame, f"  Active: {confirmed} confirmed, {tentative} tentative",
+                   (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLORS.WHITE, 1)
+        
+        y += 22
+        cv2.putText(frame, f"  Total tracked: {tracker.total_tracked}",
+                   (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLORS.WHITE, 1)
+    
     y += 30
     cv2.putText(frame, f"Cars: {car_count}  |  Ambulances: {ambulance_count}",
                (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLORS.WHITE, 1)
-    
-    y += 25
-    cv2.putText(frame, f"Filtered: {filtered_count}", (20, y),
-               cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLORS. GRAY, 1)
     
     # Lane counts with colored indicators
     if show_lanes and any(v > 0 for k, v in lane_counts.items() if k != Lane.UNKNOWN):
@@ -908,8 +1297,8 @@ def draw_controls(frame: np.ndarray) -> None:
     """Draw control bar."""
     h, w = frame.shape[:2]
     cv2.rectangle(frame, (0, h - 35), (w, h), COLORS.BLACK, -1)
-    cv2.putText(frame, "[Q] Quit | [R] ROI | [L] Lanes | [S] Setup | [D] Delete | [+/-] Sens",
-               (20, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.5, COLORS.LIGHT_GRAY, 1)
+    cv2.putText(frame, "[Q] Quit | [R] ROI | [L] Lanes | [S] Setup | [D] Delete | [C] Clear Tracks | [T] Trails | [+/-] Sens",
+               (20, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.45, COLORS.LIGHT_GRAY, 1)
 
 
 # ============================================================
@@ -957,6 +1346,7 @@ class TraffixAI:
         self.sensitivity = CONFIG.ROAD_SENSITIVITY
         self.roi_mode = "none"
         self.show_lanes = True
+        self.show_trails = True
         
         # Masks
         self.prototype_mask:  Optional[np.ndarray] = None
@@ -964,6 +1354,9 @@ class TraffixAI:
         
         # Lane detector
         self.lane_detector = LaneDetector()
+        
+        # Object tracker
+        self.tracker = ObjectTracker()
         
         # Counters
         self.fps_counter = FPSCounter()
@@ -1047,7 +1440,8 @@ class TraffixAI:
                 # Draw UI
                 draw_stats(display_frame, fps, car_count, ambulance_count,
                           filtered_count, self.roi_active, self.roi_mode,
-                          lane_counts, self.show_lanes and self.lane_detector.is_configured)
+                          lane_counts, self.show_lanes and self.lane_detector.is_configured,
+                          self.tracker)
                 draw_controls(display_frame)
                 
                 cv2.imshow('TRAFFIX-AI', display_frame)
@@ -1061,7 +1455,7 @@ class TraffixAI:
             print("✅ Cleanup complete")
     
     def _process_detections(self, frame: np.ndarray, results) -> Tuple[int, int, int, Dict[Lane, int]]:
-        """Process detections with lane detection."""
+        """Process detections with filtering, duplicate removal, and tracking."""
         car_count = 0
         ambulance_count = 0
         filtered_count = 0
@@ -1069,36 +1463,81 @@ class TraffixAI:
         
         active_mask = self.road_mask if self.roi_active else None
         
+        # Convert YOLO results to Detection objects with filtering
+        detections = []
         for box in results. boxes:
             class_id = int(box.cls[0])
             confidence = float(box.conf[0])
-            
-            # Get center point
             xyxy = box.xyxy[0]. cpu().numpy()
-            cx = int((xyxy[0] + xyxy[2]) * 0.5)
-            cy = int((xyxy[1] + xyxy[3]) * 0.5)
             
-            in_roi = is_detection_in_roi(box, active_mask)
+            detection = Detection(
+                box=xyxy,
+                class_id=class_id,
+                confidence=confidence
+            )
             
-            # Detect lane
+            # Apply filtering
+            if not detection.is_valid():
+                filtered_count += 1
+                continue
+            
+            # Check ROI
+            if active_mask is not None:
+                if not is_detection_in_roi(box, active_mask):
+                    filtered_count += 1
+                    continue
+            
+            detections.append(detection)
+        
+        # Remove duplicates
+        detections = remove_duplicate_detections(detections)
+        
+        # Detect lanes for each detection
+        lanes = []
+        for detection in detections:
+            cx, cy = detection.center
             lane = Lane.UNKNOWN
-            if in_roi and self.lane_detector.is_configured:
-                lane = self. lane_detector.detect_lane(cx, cy)
-                if lane != Lane.UNKNOWN: 
-                    lane_counts[lane] += 1
+            if self.lane_detector.is_configured:
+                lane = self.lane_detector.detect_lane(cx, cy)
+            lanes.append(lane)
+        
+        # Update tracker
+        self.tracker.update(detections, lanes)
+        
+        # Draw tracks with trails
+        if self.show_trails:
+            for track in self.tracker.tracks:
+                lane_color = LANE_COLORS.get(track.stable_lane, COLORS.GRAY)
+                draw_track_trail(frame, track, lane_color)
+        
+        # Draw tracked objects
+        for track in self.tracker.tracks:
+            lane = track.stable_lane
             
-            # Draw detection with lane info
-            show_lane_info = self.show_lanes and self.lane_detector.is_configured
-            vehicle_type, valid = draw_detection(frame, box, class_id, confidence, 
-                                                  in_roi, lane, show_lane_info)
+            # Count for lane
+            if lane != Lane.UNKNOWN:
+                lane_counts[lane] += 1
             
-            if valid:
-                if vehicle_type == "Car":
+            # Count by vehicle type (only confirmed tracks)
+            if track.confirmed:
+                if track.vehicle_type == "Car":
                     car_count += 1
                 else:
                     ambulance_count += 1
-            else:
-                filtered_count += 1
+            
+            # Draw detection box
+            show_lane_info = self.show_lanes and self.lane_detector.is_configured
+            draw_detection(
+                frame, 
+                track.get_display_box(),
+                track.class_id,
+                track.avg_confidence,
+                True,  # in_roi (already filtered)
+                lane,
+                show_lane_info,
+                track_id=track.track_id,
+                confirmed=track.confirmed
+            )
         
         return car_count, ambulance_count, filtered_count, lane_counts
     
@@ -1114,6 +1553,12 @@ class TraffixAI:
         elif key == ord('l'):
             self.show_lanes = not self.show_lanes
             print(f"Lane display {'enabled' if self.show_lanes else 'disabled'}")
+        elif key == ord('c'):
+            self.tracker.clear_all_tracks()
+            print("All tracks cleared")
+        elif key == ord('t'):
+            self.show_trails = not self.show_trails
+            print(f"Track trails {'enabled' if self.show_trails else 'disabled'}")
         elif key == ord('s'):
             self._run_setup(frame)
         elif key == ord('d'):
@@ -1171,6 +1616,7 @@ class TraffixAI:
         self.roi_active = False
         self. roi_mode = "none"
         self.lane_detector = LaneDetector()
+        self.tracker.clear_all_tracks()
         print("Configuration deleted")
     
     def _adjust_sensitivity(self, delta: int, frame: np.ndarray) -> None:
@@ -1190,6 +1636,8 @@ class TraffixAI:
         print("  [L] - Toggle lane display")
         print("  [S] - Setup ROI & lanes")
         print("  [D] - Delete configuration")
+        print("  [C] - Clear all tracks")
+        print("  [T] - Toggle track trails")
         print("  [+/-] - Adjust sensitivity")
         print("=" * 60 + "\n")
 
