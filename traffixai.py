@@ -15,6 +15,9 @@ import torch
 import time
 import json
 import os
+import requests
+import threading
+from queue import Queue
 from dataclasses import dataclass
 from typing import Optional, Tuple, List, Union, Dict
 from enum import Enum
@@ -74,6 +77,14 @@ class Config:
 
 
 @dataclass(frozen=True)
+class FirebaseConfig:
+    """Firebase Realtime Database configuration."""
+    DATABASE_URL: str = "https://traffix-ai-d02a3-default-rtdb.firebaseio.com"
+    UPDATE_INTERVAL: float = 0.5  # seconds (2 updates per second)
+    ENABLED: bool = True
+
+
+@dataclass(frozen=True)
 class Colors:
     """BGR color constants."""
     CAR:  Tuple[int, int, int] = (16, 185, 129)
@@ -112,6 +123,7 @@ LANE_COLORS:  Dict[Lane, Tuple[int, int, int]] = {
 }
 
 CONFIG = Config()
+FIREBASE_CONFIG = FirebaseConfig()
 COLORS = Colors()
 FILTERING_CONFIG = FilteringConfig()
 TRACKING_CONFIG = TrackingConfig()
@@ -122,6 +134,141 @@ KERNEL_5x5 = np.ones((5, 5), dtype=np.uint8)
 # Yellow color range for road detection (HSV)
 YELLOW_LOWER = np.array([15, 50, 50], dtype=np.uint8)
 YELLOW_UPPER = np.array([40, 255, 255], dtype=np.uint8)
+
+
+# ============================================================
+# FIREBASE INTEGRATION
+# ============================================================
+@dataclass
+class TrafficData:
+    """Traffic data structure for Firebase uploads."""
+    timestamp: int
+    total_vehicles: int
+    cars: int
+    ambulances: int
+    emergency_active: bool  # True if any ambulance detected
+    lanes: Dict[str, Dict]  # Per-lane data
+    fps: float
+    camera_online: bool
+
+
+class FirebaseUploader:
+    """Asynchronous Firebase Realtime Database uploader."""
+    
+    def __init__(self, config: FirebaseConfig):
+        self.config = config
+        self.upload_queue: Queue = Queue(maxsize=10)
+        self.upload_thread: Optional[threading.Thread] = None
+        self.stop_flag = threading.Event()
+        self.upload_count = 0
+        self.error_count = 0
+        self.last_error: Optional[str] = None
+        self.running = False
+        
+        if self.config.ENABLED:
+            self._start_uploader()
+    
+    def _start_uploader(self) -> None:
+        """Start the background uploader thread."""
+        self.upload_thread = threading.Thread(target=self._upload_worker, daemon=True)
+        self.upload_thread.start()
+        self.running = True
+    
+    def _upload_worker(self) -> None:
+        """Background worker that uploads data to Firebase."""
+        last_upload_time = 0
+        
+        while not self.stop_flag.is_set():
+            try:
+                # Rate limiting - respect update interval
+                current_time = time.time()
+                time_since_last = current_time - last_upload_time
+                
+                if time_since_last < self.config.UPDATE_INTERVAL:
+                    time.sleep(0.1)
+                    continue
+                
+                # Get data from queue (non-blocking)
+                try:
+                    data = self.upload_queue.get_nowait()
+                except:
+                    time.sleep(0.1)
+                    continue
+                
+                # Upload to Firebase
+                self._upload_to_firebase(data)
+                last_upload_time = current_time
+                
+            except Exception as e:
+                self.error_count += 1
+                self.last_error = str(e)
+                time.sleep(1)
+    
+    def _upload_to_firebase(self, traffic_data: TrafficData) -> None:
+        """Upload data to Firebase via REST API."""
+        try:
+            # Prepare JSON payload
+            payload = {
+                "traffic_data": {
+                    "timestamp": traffic_data.timestamp,
+                    "total_vehicles": traffic_data.total_vehicles,
+                    "cars": traffic_data.cars,
+                    "ambulances": traffic_data.ambulances,
+                    "emergency_active": traffic_data.emergency_active,
+                    "lanes": traffic_data.lanes
+                },
+                "system_status": {
+                    "camera_online": traffic_data.camera_online,
+                    "last_update": traffic_data.timestamp,
+                    "fps": traffic_data.fps
+                }
+            }
+            
+            # Upload via PUT request
+            endpoint = f"{self.config.DATABASE_URL}/traffix.json"
+            response = requests.put(endpoint, json=payload, timeout=5)
+            response.raise_for_status()
+            
+            self.upload_count += 1
+            
+        except requests.exceptions.RequestException as e:
+            self.error_count += 1
+            self.last_error = f"Upload failed: {e}"
+    
+    def upload_lane_data(self, traffic_data: TrafficData) -> None:
+        """Queue traffic data for upload."""
+        if not self.config.ENABLED or not self.running:
+            return
+        
+        try:
+            # Try to add to queue, drop if full
+            self.upload_queue.put_nowait(traffic_data)
+        except:
+            # Queue full, drop oldest
+            try:
+                self.upload_queue.get_nowait()
+                self.upload_queue.put_nowait(traffic_data)
+            except:
+                pass
+    
+    def get_status(self) -> Dict[str, Union[int, str, bool]]:
+        """Get uploader status for debugging."""
+        return {
+            "enabled": self.config.ENABLED,
+            "running": self.running,
+            "upload_count": self.upload_count,
+            "error_count": self.error_count,
+            "last_error": self.last_error or "None",
+            "queue_size": self.upload_queue.qsize()
+        }
+    
+    def stop(self) -> None:
+        """Stop the uploader thread."""
+        if self.running:
+            self.stop_flag.set()
+            if self.upload_thread:
+                self.upload_thread.join(timeout=2)
+            self.running = False
 
 
 # ============================================================
@@ -1246,12 +1393,15 @@ def draw_track_trail(frame: np.ndarray, track: TrackedObject, lane_color: Tuple[
 def draw_stats(frame: np.ndarray, fps: float, car_count: int, ambulance_count: int,
                filtered_count: int, roi_active: bool, roi_mode: str,
                lane_counts: Dict[Lane, int], show_lanes: bool,
-               tracker: Optional['ObjectTracker'] = None) -> None:
+               tracker: Optional['ObjectTracker'] = None,
+               firebase: Optional['FirebaseUploader'] = None) -> None:
     """Draw statistics overlay with lane counts and tracking info."""
     # Calculate panel height based on content
     panel_height = 200
     if tracker is not None:
         panel_height = 240
+    if firebase is not None and firebase.config.ENABLED:
+        panel_height += 25
     if show_lanes and any(v > 0 for k, v in lane_counts.items() if k != Lane.UNKNOWN):
         panel_height += 120
     
@@ -1269,6 +1419,14 @@ def draw_stats(frame: np.ndarray, fps: float, car_count: int, ambulance_count: i
     
     y += 30
     cv2.putText(frame, f"FPS:  {int(fps)}", (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, COLORS.WHITE, 1)
+    
+    # Firebase status
+    if firebase is not None and firebase.config.ENABLED:
+        y += 25
+        status = firebase.get_status()
+        fb_color = COLORS.POINT if status['error_count'] == 0 else (0, 165, 255)
+        cv2.putText(frame, f"Firebase: {status['upload_count']} uploads, {status['error_count']} errors",
+                   (20, y), cv2.FONT_HERSHEY_SIMPLEX, 0.5, fb_color, 1)
     
     # Tracking stats
     if tracker is not None:
@@ -1377,6 +1535,9 @@ class TraffixAI:
         # Object tracker
         self.tracker = ObjectTracker()
         
+        # Firebase uploader
+        self.firebase = FirebaseUploader(FIREBASE_CONFIG)
+        
         # Counters
         self.fps_counter = FPSCounter()
         self.update_counter = 0
@@ -1449,18 +1610,21 @@ class TraffixAI:
                     )[0]
                 
                 # Process detections
-                car_count, ambulance_count, filtered_count, lane_counts = self._process_detections(
+                car_count, ambulance_count, filtered_count, lane_counts, lane_ambulances = self._process_detections(
                     display_frame, results
                 )
                 
                 # Update FPS
                 fps = self.fps_counter.update()
                 
+                # Upload to Firebase
+                self._upload_to_firebase(car_count, ambulance_count, lane_counts, lane_ambulances, fps)
+                
                 # Draw UI
                 draw_stats(display_frame, fps, car_count, ambulance_count,
                           filtered_count, self.roi_active, self.roi_mode,
                           lane_counts, self.show_lanes and self.lane_detector.is_configured,
-                          self.tracker)
+                          self.tracker, self.firebase)
                 draw_controls(display_frame)
                 
                 cv2.imshow('TRAFFIX-AI', display_frame)
@@ -1469,16 +1633,18 @@ class TraffixAI:
                     break
         
         finally:
+            self.firebase.stop()
             self.cap.release()
             cv2.destroyAllWindows()
             print("✅ Cleanup complete")
     
-    def _process_detections(self, frame: np.ndarray, results) -> Tuple[int, int, int, Dict[Lane, int]]:
+    def _process_detections(self, frame: np.ndarray, results) -> Tuple[int, int, int, Dict[Lane, int], Dict[Lane, bool]]:
         """Process detections with filtering, duplicate removal, and tracking."""
         car_count = 0
         ambulance_count = 0
         filtered_count = 0
         lane_counts = {lane: 0 for lane in Lane}
+        lane_ambulances = {lane: False for lane in Lane}  # Track ambulances per lane
         
         active_mask = self.road_mask if self.roi_active else None
         
@@ -1536,6 +1702,9 @@ class TraffixAI:
             # Count for lane
             if lane != Lane.UNKNOWN:
                 lane_counts[lane] += 1
+                # Track ambulances in each lane
+                if track.class_id == 0:  # Ambulance
+                    lane_ambulances[lane] = True
             
             # Count by vehicle type (only confirmed tracks)
             if track.confirmed:
@@ -1558,7 +1727,35 @@ class TraffixAI:
                 confirmed=track.confirmed
             )
         
-        return car_count, ambulance_count, filtered_count, lane_counts
+        return car_count, ambulance_count, filtered_count, lane_counts, lane_ambulances
+    
+    def _upload_to_firebase(self, car_count: int, ambulance_count: int, 
+                           lane_counts: Dict[Lane, int], lane_ambulances: Dict[Lane, bool],
+                           fps: float) -> None:
+        """Prepare and upload traffic data to Firebase."""
+        # Prepare lane data
+        lanes_data = {}
+        for lane in [Lane.NORTH, Lane.SOUTH, Lane.EAST, Lane.WEST, Lane.JUNCTION]:
+            lane_name = lane.value.lower()
+            lanes_data[lane_name] = {
+                "count": lane_counts.get(lane, 0),
+                "has_ambulance": lane_ambulances.get(lane, False)
+            }
+        
+        # Create TrafficData object
+        traffic_data = TrafficData(
+            timestamp=int(time.time()),
+            total_vehicles=car_count + ambulance_count,
+            cars=car_count,
+            ambulances=ambulance_count,
+            emergency_active=ambulance_count > 0,
+            lanes=lanes_data,
+            fps=fps,
+            camera_online=True
+        )
+        
+        # Upload to Firebase
+        self.firebase.upload_lane_data(traffic_data)
     
     def _handle_input(self, frame: np.ndarray) -> bool:
         """Handle keyboard input."""
