@@ -17,7 +17,7 @@ import json
 import os
 import requests
 import threading
-from queue import Queue
+from queue import Queue, Empty, Full
 from dataclasses import dataclass
 from typing import Optional, Tuple, List, Union, Dict
 from enum import Enum
@@ -191,7 +191,7 @@ class FirebaseUploader:
                 # Get data from queue (non-blocking)
                 try:
                     data = self.upload_queue.get_nowait()
-                except Exception:
+                except Empty:
                     time.sleep(0.1)
                     continue
                 
@@ -243,13 +243,13 @@ class FirebaseUploader:
         try:
             # Try to add to queue, drop if full
             self.upload_queue.put_nowait(traffic_data)
-        except Exception:
+        except Full:
             # Queue full, silently drop the oldest data and add new
             # This ensures we always have the latest data
             try:
                 self.upload_queue.get_nowait()
                 self.upload_queue.put_nowait(traffic_data)
-            except Exception:
+            except (Empty, Full):
                 # If we still can't add, just drop this update
                 pass
     
@@ -1737,7 +1737,10 @@ class TraffixAI:
         """Prepare and upload traffic data to Firebase."""
         # Prepare lane data
         lanes_data = {}
-        for lane in [Lane.NORTH, Lane.SOUTH, Lane.EAST, Lane.WEST, Lane.JUNCTION]:
+        for lane in Lane:
+            # Skip UNKNOWN lane
+            if lane == Lane.UNKNOWN:
+                continue
             lane_name = lane.value.lower()
             lanes_data[lane_name] = {
                 "count": lane_counts.get(lane, 0),
