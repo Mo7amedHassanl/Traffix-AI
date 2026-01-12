@@ -191,7 +191,7 @@ class FirebaseUploader:
                 # Get data from queue (non-blocking)
                 try:
                     data = self.upload_queue.get_nowait()
-                except:
+                except Exception:
                     time.sleep(0.1)
                     continue
                 
@@ -243,12 +243,14 @@ class FirebaseUploader:
         try:
             # Try to add to queue, drop if full
             self.upload_queue.put_nowait(traffic_data)
-        except:
-            # Queue full, drop oldest
+        except Exception:
+            # Queue full, silently drop the oldest data and add new
+            # This ensures we always have the latest data
             try:
                 self.upload_queue.get_nowait()
                 self.upload_queue.put_nowait(traffic_data)
-            except:
+            except Exception:
+                # If we still can't add, just drop this update
                 pass
     
     def get_status(self) -> Dict[str, Union[int, str, bool]]:
